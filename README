@@ -1,0 +1,60 @@
+This repository contains code related to Ultra-Fast Unscented Kalman Inversion
+
+UKI.jl Contains code related to the UF-UKI algorithm.
+
+The algorithm is designed to be separated from the particular model code.
+
+It is probably easiest to understand the structure from the ergodic_test and batch_test functions in the uki_v4_paper_functions.jl file. These implement a calibration run of Lorenz '96 with specified hyperparameters.
+
+Model code for Lorenz '96 is stored in Lorenz.jl
+
+Supporting code for Held-Suarez is stored in held_suarez_uki_funcs.jl
+
+Code used for Lorenz '96 experiments in our paper can be found in L96_ufuki_testing.ipynb
+However, because the tests of different hyperparameters can be expensive for running on a personal computer, we also include example scripts for running on a cluster. These are designed to be used with NCAR's Derecho system so may be need to be modified to run on other systems. These scripts are uki_batch_param_test_script.sh, uki_batch_param_test.jl, uki_ergodic_param_test_script.sh, and uki_ergodic_param_test.jl.
+
+We utilized the the CESM (https://www.cesm.ucar.edu/models/cesm2) implementation of the Held-Suarez model (https://www.cesm.ucar.edu/models/simple/held-suarez). Those trying to replicate our results should follow the documentation for CESM and CAM. However, we created forked versions of multiple repositories to support runtime parameters and the ability to group the ultra-short model runs to prevent scheduler overload. These are found at https://github.com/teopb/ccs_config_cesm, https://github.com/teopb/CAM, and https://github.com/teopb/atmospheric_physics . One should use those repositories in place of the default versions.
+
+The sample scripts calibration_scenario_files/n01sigma-4cov-1_run_script.sh and calibration_scenario_files/n01sigma-4cov-1iters300_ergodic_run_script.sh can be used to automatically create the necessary files to run ergodic UKI or UF-UKI on a cluster like derecho. You will need to make your own sample model runs that get cloned. We used `./create_newcase --case /glade/work/teopb/CESM_cases/HS_ground_truth --compset FHS94 --res T42z30_T42_mg17` with a length of 600 days for the ergodic (and ground truth) and 9 timesteps for the short runs.
+
+The ground truth run should be created with the following modifications.
+
+We want to run our ground truth run for 600 days. A short run is set to 3 hours or 9 timesteps. Saving every 9th timestep as a restart file, we will use `./xmlchange` to set these conditions
+	1. `./xmlchange STOP_OPTION='ndays'`
+	2. `./xmlchange STOP_N=600`
+	3. `./xmlchange REST_OPTION='nsteps'`
+	4. `./xmlchange REST_N=9`
+Finally let's turn off archiving, a step I remember not needing but basically spawns another job. 
+	1. `./xmlchange DOUT_S=FALSE`
+We also need to add a new file `user_nl_cam` with the following output info. This says to make a new history file, with instantaneous wind and temp values
+```
+&camexp
+fincl2 = 'U:I','V:I','T:I'
+nhtfrq = 0 , 9
+mfilt  = 1 , 5000
+```
+
+In contrast a sample short run is created with
+	1. `./xmlchange STOP_OPTION='nsteps'`
+	2. `./xmlchange STOP_N=9`
+And
+`user_nl_cam`
+```
+&camexp
+fincl2 = 'U:I','V:I','T:I'
+nhtfrq = 0 , 9
+mfilt  = 1 , 1
+```
+
+By default the model uses the ground truth parameters [40, 4, 60, 10], but those can be modified in the `user_nl_cam` file as:
+
+```
+&camexp
+fincl2 = 'U:I','V:I','T:I'
+nhtfrq = 0 , 9
+mfilt  = 1 , 5000
+held_suarez_efolda = 2.0d0
+held_suarez_efolds = 2.0d0
+held_suarez_delta_T_y = 20.0d0
+held_suarez_delta_theta_z = 20.0d0
+```
