@@ -2,6 +2,7 @@ using DifferentialEquations
 using Distributions
 using Random
 using Statistics
+using LinearAlgebra
 
 mutable struct lorenz_params
     noise
@@ -165,6 +166,65 @@ function L96_two!(du, u, p, t)
             du[L96_index(K, J,k, j, l)] = c * (-b * u[L96_index(K, J,k,j+1,l)] * (u[L96_index(K, J,k,j+2,l)] - u[L96_index(K, J,k,j-1,l)]) - u[L96_index(K, J,k,j,l)] + (h/J) * u[k])
         end
     end
+end
+
+# A reduced L96 model describing just 1 level with a 4th degree polynomial 
+# parameterization in place of the Y variables. Based off Wilks 2005, without stochastic term.
+# parameterization term = b0 + b_1X_k + b_2X_k^2 + b_3X_k^3 + b_4X_k^4
+
+#TODO Update transform func
+mutable struct L96_one_params
+    K
+    u0
+    dt
+    timestep
+    t_end
+    toss
+    noise
+    noise_ranges
+    # Unperturbed ground truth to use as initial conditions
+    initial_conditions
+    uki_thetas
+    transform_func_to_L96_one
+
+    function L96_one_params(;K=36, X_init=nothing,
+        dt=0.001, timestep=0.1, t_end=500, toss=0, noise=0.0, noise_ranges=nothing, initial_conditions=nothing, uki_thetas=nothing, transform_func_to_L96_one = L96_trans_C2_to_L96)
+
+        if X_init === nothing
+            d = Normal(0, 1)
+            X_init = rand(d, K)
+        end
+
+        u0 = vcat(X_init)
+
+        return new(K, u0, dt, timestep, t_end, toss, noise, noise_ranges, initial_conditions, uki_thetas, transform_func_to_L96_one)
+    end
+
+end
+
+# Parameterization for one level Lorenz 96 model from Wilks,
+function wilks_param_L96_one(x, p)
+    K, b0, b1, b2, b3, b4 = p
+    g = b0 + b1 * x + b2 * x^2 + b3 * x^3 + b4 * x^4
+    return g
+end
+
+function L96_one!(du, u, p, t)
+    K, b0, b1, b2, b3, b4 = p
+
+    K = trunc(Int, K)
+
+    # X values
+    l = 1
+    J = 0
+
+    for k in 1:K
+        # g = parameterizaion
+        g = wilks_param_L96_one(u[L96_index(K, J,k,0,l)], p)
+        du[k] = -u[L96_index(K, J,k-1,0,l)] * (u[L96_index(K, J,k-2,0,l)] - u[L96_index(K, J,k+1,0,l)]) - u[L96_index(K, J,k,0,l)] + g
+        
+    end
+
 end
 
 function Sigma_eta_func(y, means, divs)
@@ -563,7 +623,7 @@ end
 
 # A moments function for L96 that returns full output
 # Used to get ground truth before noise and moments
-function L96_no_moments(y, noise_mag, params; y_matr=nothing)
+function L96_no_moments(y, noise_mag, params; y_matr=nothing,noise_ranges=nothing, debug=false)
     K = params.K
     J = params.J
 
@@ -579,7 +639,12 @@ function L96_no_moments(y, noise_mag, params; y_matr=nothing)
     end
 
     if noise_mag > 0.0
-        noisy_y = apply_noise(y_matr, noise_mag)
+        if noise_ranges === nothing
+            noisy_y, noise_ranges = apply_noise(y_matr, noise_mag, debug=debug)
+        else
+            noisy_y, _ = apply_noise(y_matr, noise_mag, noise_ranges=noise_ranges, debug=debug)
+        end
+
     else
         noisy_y = y_matr
     end
@@ -590,6 +655,96 @@ function L96_no_moments(y, noise_mag, params; y_matr=nothing)
     return noisy_y
     
 end
+
+# A moments function for L96 for use with one level L96
+# Includes first and second moments and cross moments of first n X variables (4 by default to match Huang '22)
+function L96_one_moments(y, noise_mag, params; y_matr=nothing, n = 4, noise_ranges=nothing, debug=false)
+    K = params.K
+
+    if y_matr === nothing
+        dim_out = size(y[1], 1)
+        obs = size(y,1)
+
+        y_matr = hcat(y...)
+        # display(y_matr)
+    else
+        dim_out = size(y_matr, 1)
+        obs = size(y_matr, 2)
+    end
+
+    expanded_y = zeros(n + n + (n*(n-1))÷2, obs)
+
+    if noise_mag > 0.0
+        if noise_ranges === nothing
+            noisy_y, noise_ranges = apply_noise(y_matr, noise_mag, debug=debug)
+        else
+            noisy_y, _ = apply_noise(y_matr, noise_mag, noise_ranges=noise_ranges, debug=debug)
+        end
+
+    else
+        noisy_y = y_matr
+    end
+
+    for i in 1:size(noisy_y,2)
+        z = noisy_y[:,i]
+        # First n moments
+        for j in 1:n
+            expanded_y[j, i] = z[j]
+            expanded_y[j + n, i] = z[j]^2
+        end
+
+        # Cross moments
+        idx = 2*n + 1
+        for j in 1:(n-1)
+            for k in (j+1):n
+                expanded_y[idx, i] = z[j] * z[k]
+                idx += 1
+            end
+        end
+    end
+
+    return expanded_y
+    
+end
+
+# Mean A moments function for L96 for use with one level L96
+L96_one_moments_mean(y, noise_mag, params; y_matr=nothing, n = 4, noise_ranges=nothing, debug=false) = 
+    mean(L96_one_moments(y, noise_mag, params; y_matr=y_matr, n=n, noise_ranges=noise_ranges, debug=debug), dims=2)
+
+# A  moments function for L96 for use with one level L96 that returns full output
+# Used to get ground truth before noise and moments
+function L96_one_no_moments(y, noise_mag, params; y_matr=nothing, noise_ranges=nothing, debug=false)
+    K = params.K
+
+    if y_matr === nothing
+        dim_out = size(y[1], 1)
+        obs = size(y,1)
+
+        y_matr = hcat(y...)
+        # display(y_matr)
+    else
+        dim_out = size(y_matr, 1)
+        obs = size(y_matr, 2)
+    end
+
+    if noise_mag > 0.0
+        if noise_ranges === nothing
+            noisy_y, noise_ranges = apply_noise(y_matr, noise_mag, debug=debug)
+        else
+            noisy_y, _ = apply_noise(y_matr, noise_mag, noise_ranges=noise_ranges, debug=debug)
+        end
+
+    else
+        noisy_y = y_matr
+    end
+
+    # println("Shape of noisy y in L96_one_no_moments")
+    # display(shape(noisy_y))
+
+    return noisy_y
+    
+end
+
 
 function theta_lorenz_to_uki(theta)
     return theta
@@ -916,6 +1071,32 @@ function L96_model_full_output(theta, moments_func, transform_func, param_file::
     return y
 end
 
+# A version of L96 model full output for L96 one
+function L96_one_model_full_output(theta, moments_func, transform_func, param_file::L96_one_params; abstol=1e-6, reltol=1e-3)
+    tspan = (0.0,param_file.t_end)
+
+    # take absolute value of only parameter parts to avoid indexing float
+    theta[2:6] = transform_func(theta[2:6])
+
+    # println(theta)
+
+    prob1 = ODEProblem(L96_one!, param_file.u0, tspan, theta)
+
+    sol = solve(prob1, AutoTsit5(Rosenbrock23()), saveat = param_file.timestep, abstol=abstol, reltol=reltol, maxiters=1e7)
+    tossed = sol.u[round(Int, param_file.toss/param_file.timestep)+1:end]
+
+    # display(size(sol.u))
+    # display(tossed)
+    # println(round(Int, param_file.toss/param_file.timestep))
+    
+    y = moments_func(tossed, param_file)
+
+    # println("Shape of y in L96_one_model_full_output")
+    # display(shape(y))
+
+    return y
+end
+
 function gen_noise_mat(full_output, constant)
     full_mat = hcat(full_output...)'
     noise_var = diagm(sqrt.((mean(full_mat.^2, dims=1))*constant)[1, :])
@@ -987,6 +1168,103 @@ function batch_lorenz_96_model_part_2(sample_idxs, moments_func, N_theta, N_out,
 
             KJ_theta = vcat([model_params.K, model_params.J], transformed_theta)
             prob1 = ODEProblem(L96_two!, u_0, tspan, KJ_theta)
+            sol = solve(prob1, saveat = model_params.timestep, abstol=abstol, reltol=reltol, maxiters=1e5)
+
+            # display(sol.alg)
+            
+            # Convert retcode to symbol for comparison
+            retcode_symbol = Symbol(string(sol.retcode))
+            # println("Converted retcode to symbol: $(retcode_symbol)")
+            
+            # Check if the solver failed
+            if retcode_symbol in failure_codes
+                println("ODE solver failed with retcode: $(sol.retcode)")
+                lock(failure_lock) do
+                    failure_flag = true
+                end
+                break
+            end
+            
+            output = sol.u[round(Int, model_params.toss/model_params.timestep)+1:end]
+            sol = nothing
+
+            moments_output, _ = moments_func(output, model_params.noise, model_params, noise_ranges=model_params.noise_ranges)
+            moments_output = moments_output[:, end]
+
+            output = nothing
+
+            x_s[sigma, :, j] = moments_output
+        end
+    end
+
+    return x_s, failure_flag
+end
+
+function batch_lorenz_96_one_model_part_1!(thetas, sample_idxs, moments_func, transform_func, model_params::L96_one_params)
+    N_sigma = size(thetas, 2)
+    N_theta = size(thetas, 1)
+    transformed_thetas = zeros((N_theta, N_sigma))
+
+    # for sigma in 1:N_sigma
+    #     transformed_thetas[:, sigma] = transform_func(thetas[:, sigma])
+    # end
+
+    # model_params.uki_thetas = transformed_thetas
+
+    model_params.uki_thetas = thetas
+    # display(model_params.uki_thetas)
+end
+
+function batch_lorenz_96_one_model_part_2(sample_idxs, moments_func, N_theta, N_out, model_params::L96_one_params)
+    # println("Threads: $(Threads.nthreads())")
+    # Helper sizes
+    N_samples = size(sample_idxs, 1)
+    N_sigma = N_theta * 2 + 1
+
+    # println("N_theta: $(N_theta)")
+
+    # array to store outputs
+    x_s = zeros(N_sigma, N_out, N_samples)
+
+    # theta values
+    thetas = model_params.uki_thetas
+
+    # Solver parameters
+    abstol=1e-6
+    reltol=1e-3
+
+    # Thread-safe failure flag and lock
+    failure_flag = false
+    failure_lock = ReentrantLock()
+
+    # List of return codes that indicate failure
+    failure_codes = [:MaxIters, :DtLessThanMin, :Unstable, :InitialFailure, :ConvergenceFailure, :Failure]
+
+    Threads.@threads for sigma in 1:N_sigma
+        # Check if we should continue
+        lock(failure_lock) do
+            if failure_flag
+                return
+            end
+        end
+
+        for j in 1:N_samples
+            # Check if we should continue
+            lock(failure_lock) do
+                if failure_flag
+                    return
+                end
+            end
+
+            sample_idx = sample_idxs[j]
+            u_0 = model_params.initial_conditions[:, sample_idx - 1]
+            tspan = (0.0, model_params.t_end)
+
+            # Need to use transform function to get correct theta
+            transformed_theta = model_params.transform_func_to_L96(thetas[:, sigma])
+
+            K_theta = vcat([model_params.K], transformed_theta)
+            prob1 = ODEProblem(L96_one!, u_0, tspan, K_theta)
             sol = solve(prob1, saveat = model_params.timestep, abstol=abstol, reltol=reltol, maxiters=1e5)
 
             # display(sol.alg)
